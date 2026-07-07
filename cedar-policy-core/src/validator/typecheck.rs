@@ -100,24 +100,29 @@ impl<'a> Typechecker<'a> {
         type_errors: &mut HashSet<ValidationError>,
         warnings: &mut HashSet<ValidationWarning>,
     ) -> bool {
-        let typecheck_answers = self.typecheck_by_request_env(t);
-
-        // consolidate the results from each query environment
-        let (all_false, all_succ) = typecheck_answers.into_iter().fold(
-            (true, true),
-            |(all_false, all_succ), (_, check)| match check {
-                PolicyCheck::Success(_) => (false, all_succ),
-                PolicyCheck::Irrelevant(err, _) => {
-                    let no_err = err.is_empty();
-                    type_errors.extend(err);
-                    (all_false, all_succ && no_err)
+        // Streaming fold: never hold all envs' typed conditions live at once.
+        // Each `PolicyCheck` (and its typed condition) is dropped before the
+        // next env is computed, so peak live memory is O(one condition) rather
+        // than O(envs * condition).
+        let cond = t.condition();
+        let mut all_false = true;
+        let mut all_succ = true;
+        for unlinked_e in self.unlinked_envs.iter() {
+            for linked_e in self.link_request_env(unlinked_e, t) {
+                match self.single_env_typechecking(&linked_e, t.id(), &cond) {
+                    PolicyCheck::Success(_) => all_false = false,
+                    PolicyCheck::Irrelevant(err, _) => {
+                        all_succ = all_succ && err.is_empty();
+                        type_errors.extend(err);
+                    }
+                    PolicyCheck::Fail(err) => {
+                        type_errors.extend(err);
+                        all_false = false;
+                        all_succ = false;
+                    }
                 }
-                PolicyCheck::Fail(err) => {
-                    type_errors.extend(err);
-                    (false, false)
-                }
-            },
-        );
+            }
+        }
 
         // If every policy typechecked with type false, then the policy cannot
         // possibly apply to any request.
