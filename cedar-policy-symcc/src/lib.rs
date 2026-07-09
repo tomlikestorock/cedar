@@ -25,9 +25,9 @@ use cedar_policy::{Effect, Policy, PolicySet, RequestEnv, Schema};
 use nonempty::{nonempty, NonEmpty};
 use std::fmt;
 
-use err::{Error, Result};
+use err::Result;
 use solver::Solver;
-use symcc::{well_typed_policies, well_typed_policy, Environment, SymCompiler};
+use symcc::{well_typed_policies, well_typed_policy, SymCompiler};
 use symccopt::{
     verify_always_allows_opt, verify_always_denies_opt, verify_always_matches_opt,
     verify_disjoint_opt, verify_equivalent_opt, verify_implies_opt, verify_matches_disjoint_opt,
@@ -47,14 +47,15 @@ pub use symcc::term_type;
 pub use symcc::type_abbrevs;
 pub use symcc::verifier::Asserts;
 pub use symcc::Interpretation;
-pub use symcc::{Env, SmtLibScript, SymEnv};
+pub use symcc::{Env, SmtLibScript, SymEnv, SymSchema};
 
 impl SymEnv {
     /// Constructs a new [`SymEnv`] from the given [`Schema`] and [`RequestEnv`].
     pub fn new(schema: &Schema, req_env: &RequestEnv) -> Result<Self> {
-        let env = Environment::from_request_env(req_env, schema.as_ref())
-            .ok_or_else(|| Error::ActionNotInSchema(req_env.action().to_string()))?;
-        Ok(Self::of_env(&env)?)
+        // Delegates to SymSchema so the env-building + request-symbolization
+        // logic lives in one place. (Differential test:
+        // sym_schema_sym_env_matches_sym_env_new.)
+        SymSchema::new(schema)?.sym_env(req_env)
     }
 }
 

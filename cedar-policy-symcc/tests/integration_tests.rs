@@ -17,7 +17,7 @@ use std::str::FromStr;
  */
 use cedar_policy::{EntityUid, Policy, PolicyId, PolicySet, Schema, SlotId, Template, Validator};
 use cedar_policy_symcc::{
-    err::CompileError, solver::LocalSolver, CedarSymCompiler, CompiledPolicySet,
+    err::CompileError, solver::LocalSolver, CedarSymCompiler, CompiledPolicySet, SymEnv, SymSchema,
 };
 use cool_asserts::assert_matches;
 use std::collections::HashMap;
@@ -986,7 +986,8 @@ async fn two_policies_equivalent_to_one() {
     assert_equivalent(&mut compiler, &pset1, &pset2, &envs).await;
 }
 
-/// Tests involving action groups
+/// Tests involving action groups.
+/// Also exercises the inert-footprint prune in `enforce` (all pairs here are inert).
 #[tokio::test]
 async fn action_groups() {
     let validator = Validator::new(action_groups_schema());
@@ -1018,6 +1019,48 @@ async fn action_groups() {
     // Analysis should identify this policy is always-false
     // because the action is not in the action-group in the schema
     assert_always_denies(&mut compiler, &pset2, &envs).await;
+}
+
+/// Complements `action_groups` on the *non-inert* side: uuf ancestors, so no pair
+/// is inert and transitivity must be retained (dropping it would be unsound).
+#[tokio::test]
+async fn entity_group_transitivity() {
+    let schema = utils::schema_from_cedarstr(
+        r#"
+        entity A in [A];
+        entity Resource;
+        action view appliesTo {
+            principal: [A],
+            resource: [Resource]
+        };
+    "#,
+    );
+    let validator = Validator::new(schema);
+    let pset1 = utils::pset_from_text(
+        r#"
+        permit(principal, action, resource)
+        when {
+            A::"x" in A::"y" && A::"y" in A::"z"
+        };
+    "#,
+        &validator,
+    );
+    let pset2 = utils::pset_from_text(
+        r#"
+        permit(principal, action, resource)
+        when {
+            A::"x" in A::"z"
+        };
+    "#,
+        &validator,
+    );
+
+    let mut compiler = CedarSymCompiler::new(LocalSolver::cvc5().unwrap()).unwrap();
+    let envs = Environments::new(validator.schema(), "A", "Action::\"view\"", "Resource");
+
+    // Provable only via the retained transitivity axiom over the literal
+    // uuf-ancestor entities `A::"x"`, `A::"y"`, `A::"z"`.
+    assert_implies(&mut compiler, &pset1, &pset2, &envs).await;
 }
 
 /// Some regression tests from previous iterations of CedarSymCompiler
@@ -2529,5 +2572,37 @@ async fn template_linked_policy_unsupported() {
         Some(cedar_policy_symcc::err::Error::CompileError(
             CompileError::UnsupportedFeature(..)
         ))
+    );
+}
+
+/// `SymSchema::sym_env` reuses shared symbolic entities across request envs
+/// instead of rebuilding them per env (as `SymEnv::new` does), and its doc
+/// claims the result is *identical* to `SymEnv::new`. Every other test builds
+/// envs via `SymEnv::new`, so this is the sole guard that the cheaper reuse
+/// path has not diverged. `sample_schema`'s entity hierarchy (`Thing in
+/// Account`) exercises the shared ancestor tables.
+#[test]
+fn sym_schema_sym_env_matches_sym_env_new() {
+    let schema = sample_schema();
+    let req_env = utils::req_env_from_strs("Identity", "Action::\"view\"", "Thing");
+    let reused = SymSchema::new(&schema).unwrap().sym_env(&req_env).unwrap();
+    let fresh = SymEnv::new(&schema, &req_env).unwrap();
+    assert_eq!(reused, fresh);
+}
+
+/// `SymSchema::sym_env` (and thus `SymEnv::new`, which delegates to it) must
+/// surface `ActionNotInSchema` when the request env names an action absent from
+/// the schema, rather than panicking or building a bogus env.
+#[test]
+fn sym_schema_sym_env_rejects_unknown_action() {
+    let schema = sample_schema();
+    let req_env = utils::req_env_from_strs("Identity", "Action::\"nonexistent\"", "Thing");
+    let err = SymSchema::new(&schema)
+        .unwrap()
+        .sym_env(&req_env)
+        .unwrap_err();
+    assert!(
+        matches!(err, cedar_policy_symcc::err::Error::ActionNotInSchema(_)),
+        "expected ActionNotInSchema, got {err:?}"
     );
 }

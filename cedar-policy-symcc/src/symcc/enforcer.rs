@@ -236,12 +236,65 @@ pub(crate) fn transitivity(t1: &Term, t2: &Term, es: &SymEntities) -> Term {
     }
 }
 
-/// Returns the ground acyclicity and transitivity assumptions for xs and env
+/// Whether every ancestor function of `t`'s entity type is a concrete `.udf`
+/// table rather than an uninterpreted `.uuf` symbol. Mirrors cedar-lean `allUdf`.
+///
+/// Written as explicit early-returns rather than a nested `match` so each branch
+/// states what holds, without reasoning about the negation.
+fn all_udf(es: &SymEntities, t: &Term) -> bool {
+    // Non-optional or non-entity terms carry no ancestor table, so they assert
+    // nothing about ancestors and are never inert.
+    let TermType::Option { ty } = t.type_of() else {
+        return false;
+    };
+    let TermType::Entity { ety } = ty.as_ref() else {
+        return false;
+    };
+    // A type with no ancestor table has nothing uninterpreted to assert.
+    let Some(anc) = es.ancestors(ety) else {
+        return true;
+    };
+    // All-udf iff no ancestor function is an uninterpreted `.uuf`.
+    anc.values().all(|f| matches!(f, UnaryFunction::Udf(_)))
+}
+
+/// A footprint term is *inert* when it is a literal with only concrete (`.udf`)
+/// ancestor tables, so its transitivity smart-constructs to `true` and `enforce`
+/// skips it. Mirrors cedar-lean `inert`.
+fn inert(es: &SymEntities, t: &Term) -> bool {
+    // INVARIANT: the `is_literal` guard is load-bearing — a non-literal all-udf
+    // term still yields a symbolic `ite` from `app`, so it must not be pruned.
+    t.is_literal() && all_udf(es, t)
+}
+
+/// Returns the ground acyclicity and transitivity assumptions for `xs` and `env`.
+///
+/// Skips transitivity over *inert* footprint pairs (see `inert`) to avoid the
+/// O(N²) growth in emitted transitivity terms. Sound and complete per cedar-lean
+/// `transitive_implies_Transitive_udf_udf` and `mem_transitivePruned_mem_transitive`.
 pub fn enforce<'a>(xs: impl IntoIterator<Item = &'a Expr>, env: &SymEnv) -> BTreeSet<Term> {
     let ts = footprints(xs, env);
-    let ac = ts.iter().map(|t| acyclicity(t, &env.entities));
-    let tr = ts
-        .iter()
-        .flat_map(|t| ts.iter().map(|t2| transitivity(t, t2, &env.entities)));
-    ac.chain(tr).collect()
+    let es = &env.entities;
+
+    // Tag each footprint term with whether it is inert (see `inert`), hoisting
+    // the per-term half of the test out of the N² loop below.
+    let tagged: Vec<(&Term, bool)> = ts.iter().map(|t| (t, inert(es, t))).collect();
+
+    let mut out: BTreeSet<Term> = ts.iter().map(|t| acyclicity(t, es)).collect();
+    // This nested loop is N² in the footprint size. If that ever becomes a
+    // bottleneck, replace it with a linear pass that only pairs each kept
+    // (non-inert) term with the others, instead of walking every pair.
+    for &(t1, inert1) in &tagged {
+        for &(t2, inert2) in &tagged {
+            // Both inert: `app` on their concrete tables makes transitivity
+            // smart-construct to `true`, so skip the pair (the emitted Set is
+            // unchanged modulo that `true` — see this fn's doc).
+            if inert1 && inert2 {
+                continue;
+            }
+            // Otherwise the pair may carry a real constraint, so emit it.
+            out.insert(transitivity(t1, t2, es));
+        }
+    }
+    out
 }
